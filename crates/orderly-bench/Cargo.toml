@@ -1,0 +1,25 @@
+[package]
+name = "orderly-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Benchmarks for Orderly matching throughput and latency"
+publish = false
+
+[[bin]]
+name = "orderly-load"
+path = "src/load.rs"
+
+[dependencies]
+orderly-core = { workspace = true }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "engine"
+harness = false

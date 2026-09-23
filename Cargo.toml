@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/orderly-core",
+    "crates/orderly-server",
+    "crates/orderly-bench",
+]
+default-members = ["crates/orderly-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Orderly Contributors"]
+
+[workspace.dependencies]
+orderly-core = { path = "crates/orderly-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures-util = "0.3"
