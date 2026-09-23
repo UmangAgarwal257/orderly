@@ -51,7 +51,18 @@ async fn place_orders_and_trade_via_rest() {
     assert!(bid.status().is_success());
     let body = bid.json::<serde_json::Value>().await.unwrap();
     assert_eq!(body["status"], "filled");
-    assert!(body["trades"].as_array().unwrap().len() >= 1);
+    let order_id = body["order_id"].as_u64().unwrap();
+
+    let order = client
+        .get(format!("{}/v1/orders/{}", base, order_id))
+        .send()
+        .await
+        .unwrap();
+    assert!(order.status().is_success());
+    assert_eq!(
+        order.json::<serde_json::Value>().await.unwrap()["status"],
+        "filled"
+    );
 
     let trades = client
         .get(format!("{}/v1/trades", base))
@@ -61,13 +72,13 @@ async fn place_orders_and_trade_via_rest() {
         .json::<serde_json::Value>()
         .await
         .unwrap();
-    assert!(trades.as_array().unwrap().len() >= 1);
+    assert!(!trades.as_array().unwrap().is_empty());
 
     server.abort();
 }
 
 #[tokio::test]
-async fn websocket_receives_trade() {
+async fn websocket_receives_trade_and_delta() {
     let (base, server) = spawn_test_server().await;
     let ws_url = base.replace("http://", "ws://") + "/v1/ws";
     let client = reqwest::Client::new();
@@ -102,16 +113,22 @@ async fn websocket_receives_trade() {
         .unwrap();
 
     let mut saw_trade = false;
-    for _ in 0..10 {
+    let mut saw_delta = false;
+    for _ in 0..20 {
         if let Some(Ok(WsMessage::Text(text))) = ws.next().await {
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-            if v.get("channel") == Some(&json!("trade")) {
-                saw_trade = true;
+            match v.get("channel").and_then(|c| c.as_str()) {
+                Some("trade") => saw_trade = true,
+                Some("bookdelta") => saw_delta = true,
+                _ => {}
+            }
+            if saw_trade && saw_delta {
                 break;
             }
         }
     }
     assert!(saw_trade, "expected trade on websocket");
+    assert!(saw_delta, "expected book delta on websocket");
 
     server.abort();
 }

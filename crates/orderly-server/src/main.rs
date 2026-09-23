@@ -7,7 +7,9 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("orderly_server=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("orderly_server=info".parse().unwrap()),
+        )
         .init();
 
     let engine = spawn_engine_task();
@@ -21,5 +23,32 @@ async fn main() {
     tracing::info!("orderly listening on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
-    axum::serve(listener, app).await.expect("serve");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("serve");
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => tracing::info!("shutdown requested"),
+        () = terminate => tracing::info!("terminate received"),
+    }
 }

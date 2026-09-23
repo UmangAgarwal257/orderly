@@ -51,12 +51,14 @@ async fn main() {
                 order_type: OrderType::Limit { price },
                 qty: 10,
                 client_order_id: None,
+                max_matches: None,
             });
             let _ = eng.submit(NewOrder {
                 side: Side::Bid,
                 order_type: OrderType::Limit { price },
                 qty: 10,
                 client_order_id: None,
+                max_matches: None,
             });
         }
     }
@@ -74,12 +76,13 @@ async fn main() {
             let mut count = 0u64;
             while Instant::now() < deadline {
                 let side = if t % 2 == 0 { Side::Bid } else { Side::Ask };
-                let price = 100 + (count % 50) as u64;
+                let price = 100 + (count % 50);
                 let order = NewOrder {
                     side,
                     order_type: OrderType::Limit { price },
                     qty: 1,
                     client_order_id: None,
+                    max_matches: None,
                 };
                 let (ack_tx, ack_rx) = oneshot::channel();
                 let start = Instant::now();

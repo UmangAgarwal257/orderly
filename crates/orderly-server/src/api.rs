@@ -1,19 +1,22 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use orderly_core::{
-    EngineError, NewOrder, OrderBookSnapshot, OrderId, OrderStatus, OrderType, Side, SubmitResult,
-    Trade,
+    EngineError, NewOrder, OrderBookSnapshot, OrderId, OrderRecord, OrderStatus, OrderType, Side,
+    SubmitResult, Trade,
 };
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use crate::engine_task::{EngineHandle, MarketEvent};
+use crate::config::{
+    dev_cors_enabled, DEFAULT_BOOK_DEPTH, DEFAULT_TRADES_QUERY, MAX_BOOK_DEPTH, MAX_TRADES_QUERY,
+};
+use crate::engine_task::{initial_book_snapshot, EngineHandle, MarketEvent};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,15 +24,30 @@ pub struct AppState {
 }
 
 pub fn router(state: AppState) -> Router {
+    let cors = if dev_cors_enabled() {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers(Any)
+    } else {
+        CorsLayer::new()
+            .allow_origin([
+                HeaderValue::from_static("http://localhost:3000"),
+                HeaderValue::from_static("http://127.0.0.1:3000"),
+            ])
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers(Any)
+    };
+
     Router::new()
         .route("/health", get(health))
         .route("/v1/orders", post(place_order))
-        .route("/v1/orders/{id}", delete(cancel_order))
+        .route("/v1/orders/{id}", get(get_order).delete(cancel_order))
         .route("/v1/orderbook", get(get_orderbook))
         .route("/v1/trades", get(get_trades))
         .route("/v1/ws", get(ws_handler))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
 }
 
@@ -40,11 +58,10 @@ async fn health() -> impl IntoResponse {
 #[derive(Debug, Deserialize)]
 struct PlaceOrderRequest {
     side: Side,
-    #[serde(rename = "type")]
-    order_type: String,
-    price: Option<u64>,
     qty: u64,
     client_order_id: Option<u64>,
+    #[serde(flatten)]
+    order_type: OrderType,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,30 +70,22 @@ struct PlaceOrderResponse {
     status: OrderStatus,
     filled_qty: u64,
     remaining_qty: u64,
+    cancelled_qty: u64,
     trades: Vec<Trade>,
     reject_reason: Option<String>,
+    client_order_id: Option<u64>,
 }
 
 async fn place_order(
     State(state): State<AppState>,
     Json(body): Json<PlaceOrderRequest>,
 ) -> Result<Json<PlaceOrderResponse>, ApiError> {
-    let order_type = match body.order_type.as_str() {
-        "limit" => {
-            let price = body
-                .price
-                .ok_or_else(|| ApiError::bad_request("limit orders require price"))?;
-            OrderType::Limit { price }
-        }
-        "market" => OrderType::Market,
-        other => return Err(ApiError::bad_request(format!("unknown order type: {other}"))),
-    };
-
     let order = NewOrder {
         side: body.side,
-        order_type,
+        order_type: body.order_type,
         qty: body.qty,
         client_order_id: body.client_order_id,
+        max_matches: None,
     };
 
     let result = state.engine.submit(order).await?;
@@ -90,9 +99,21 @@ impl From<SubmitResult> for PlaceOrderResponse {
             status: r.status,
             filled_qty: r.filled_qty,
             remaining_qty: r.remaining_qty,
+            cancelled_qty: r.cancelled_qty,
             trades: r.trades,
             reject_reason: r.reject_reason,
+            client_order_id: r.client_order_id,
         }
+    }
+}
+
+async fn get_order(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<Json<OrderRecord>, ApiError> {
+    match state.engine.get_order(OrderId(id)).await {
+        Some(record) => Ok(Json(record)),
+        None => Err(ApiError::not_found("order not found")),
     }
 }
 
@@ -113,7 +134,7 @@ async fn get_orderbook(
     State(state): State<AppState>,
     Query(q): Query<OrderbookQuery>,
 ) -> Json<OrderBookSnapshot> {
-    let depth = q.depth.unwrap_or(20).min(100);
+    let depth = q.depth.unwrap_or(DEFAULT_BOOK_DEPTH).min(MAX_BOOK_DEPTH);
     Json(state.engine.snapshot(depth).await)
 }
 
@@ -126,10 +147,11 @@ async fn get_trades(
     State(state): State<AppState>,
     Query(q): Query<TradesQuery>,
 ) -> Json<Vec<Trade>> {
-    let limit = q.limit.unwrap_or(100).min(1000);
-    let trades = state.engine.trades.lock().await;
-    let start = trades.len().saturating_sub(limit);
-    Json(trades.iter().skip(start).cloned().collect())
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_TRADES_QUERY)
+        .min(MAX_TRADES_QUERY);
+    Json(state.engine.recent_trades(limit).await)
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -146,17 +168,19 @@ struct WsClientMessage {
 #[serde(tag = "channel", rename_all = "lowercase")]
 enum WsServerMessage {
     Trade { data: Trade },
+    BookDelta { data: orderly_core::BookDelta },
     Book { data: OrderBookSnapshot },
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
-    let mut events = state.engine.events.subscribe();
+    let mut events = state.engine.subscribe();
 
-    let depth = 20usize;
-    let initial = state.engine.snapshot(depth).await;
-    let hello = WsServerMessage::Book { data: initial };
-    if send_json(&mut sender, &hello).await.is_err() {
+    let initial = initial_book_snapshot(&state.engine).await;
+    if send_json(&mut sender, &WsServerMessage::Book { data: initial })
+        .await
+        .is_err()
+    {
         return;
     }
 
@@ -186,20 +210,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             evt = events.recv() => {
                 match evt {
                     Ok(MarketEvent::Trade(trade)) if want_trades => {
-                        let msg = WsServerMessage::Trade { data: trade };
-                        if send_json(&mut sender, &msg).await.is_err() {
+                        if send_json(&mut sender, &WsServerMessage::Trade { data: trade }).await.is_err() {
                             break;
                         }
                     }
-                    Ok(MarketEvent::BookUpdate { snapshot }) if want_book => {
-                        let msg = WsServerMessage::Book { data: snapshot };
-                        if send_json(&mut sender, &msg).await.is_err() {
+                    Ok(MarketEvent::BookDelta(delta)) if want_book => {
+                        if send_json(&mut sender, &WsServerMessage::BookDelta { data: delta }).await.is_err() {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(MarketEvent::Trade(_) | MarketEvent::BookDelta(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "websocket client lagged on market events");
+                        continue;
+                    }
                     Err(_) => break,
-                    _ => {}
                 }
             }
         }
@@ -211,7 +236,10 @@ async fn send_json(
     msg: &WsServerMessage,
 ) -> Result<(), ()> {
     let text = serde_json::to_string(msg).map_err(|_| ())?;
-    sender.send(Message::Text(text.into())).await.map_err(|_| ())
+    sender
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|_| ())
 }
 
 #[derive(Debug)]
@@ -227,23 +255,24 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    fn not_found(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: msg.into(),
+        }
+    }
 }
 
 impl From<EngineError> for ApiError {
     fn from(err: EngineError) -> Self {
         match err {
-            EngineError::OrderNotFound => Self {
-                status: StatusCode::NOT_FOUND,
-                message: err.to_string(),
-            },
+            EngineError::OrderNotFound => Self::not_found(err.to_string()),
             EngineError::NotCancellable(_, _) => Self {
                 status: StatusCode::CONFLICT,
                 message: err.to_string(),
             },
-            EngineError::InvalidOrder(_) => Self {
-                status: StatusCode::BAD_REQUEST,
-                message: err.to_string(),
-            },
+            EngineError::InvalidOrder(_) => Self::bad_request(err.to_string()),
         }
     }
 }

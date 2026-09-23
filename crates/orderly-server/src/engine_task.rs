@@ -1,12 +1,16 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 
-use orderly_core::{BookDelta, Engine, EngineError, NewOrder, OrderBookSnapshot, OrderId, SubmitResult, Trade};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use orderly_core::{
+    BookDelta, Engine, EngineError, NewOrder, OrderBookSnapshot, OrderId, OrderRecord,
+    SubmitResult, Trade,
+};
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::config::DEFAULT_BOOK_DEPTH;
 
 const TRADE_HISTORY: usize = 10_000;
 
-pub enum EngineCommand {
+enum EngineCommand {
     Submit {
         order: NewOrder,
         respond_to: oneshot::Sender<Result<SubmitResult, EngineError>>,
@@ -19,118 +23,162 @@ pub enum EngineCommand {
         depth: usize,
         respond_to: oneshot::Sender<OrderBookSnapshot>,
     },
+    GetOrder {
+        order_id: OrderId,
+        respond_to: oneshot::Sender<Option<OrderRecord>>,
+    },
+    RecentTrades {
+        limit: usize,
+        respond_to: oneshot::Sender<Vec<Trade>>,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum MarketEvent {
     Trade(Trade),
-    BookUpdate { snapshot: OrderBookSnapshot },
+    BookDelta(BookDelta),
 }
 
 #[derive(Clone)]
 pub struct EngineHandle {
-    pub cmd_tx: mpsc::Sender<EngineCommand>,
-    pub events: broadcast::Sender<MarketEvent>,
-    pub trades: Arc<Mutex<VecDeque<Trade>>>,
+    cmd_tx: mpsc::Sender<EngineCommand>,
+    events: broadcast::Sender<MarketEvent>,
 }
 
 impl EngineHandle {
+    pub fn subscribe(&self) -> broadcast::Receiver<MarketEvent> {
+        self.events.subscribe()
+    }
+
     pub async fn submit(&self, order: NewOrder) -> Result<SubmitResult, EngineError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(EngineCommand::Submit {
-                order,
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| EngineError::InvalidOrder("engine stopped".into()))?;
+        self.send(EngineCommand::Submit {
+            order,
+            respond_to: tx,
+        })
+        .await?;
         rx.await
             .map_err(|_| EngineError::InvalidOrder("engine dropped response".into()))?
     }
 
     pub async fn cancel(&self, order_id: OrderId) -> Result<(), EngineError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(EngineCommand::Cancel {
-                order_id,
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| EngineError::InvalidOrder("engine stopped".into()))?;
+        self.send(EngineCommand::Cancel {
+            order_id,
+            respond_to: tx,
+        })
+        .await?;
         rx.await
             .map_err(|_| EngineError::InvalidOrder("engine dropped response".into()))?
     }
 
     pub async fn snapshot(&self, depth: usize) -> OrderBookSnapshot {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(EngineCommand::Snapshot {
-                depth,
-                respond_to: tx,
-            })
-            .await
-            .expect("engine running");
+        self.send(EngineCommand::Snapshot {
+            depth,
+            respond_to: tx,
+        })
+        .await
+        .expect("engine running");
         rx.await.expect("engine response")
+    }
+
+    pub async fn get_order(&self, order_id: OrderId) -> Option<OrderRecord> {
+        let (tx, rx) = oneshot::channel();
+        self.send(EngineCommand::GetOrder {
+            order_id,
+            respond_to: tx,
+        })
+        .await
+        .expect("engine running");
+        rx.await.expect("engine response")
+    }
+
+    pub async fn recent_trades(&self, limit: usize) -> Vec<Trade> {
+        let (tx, rx) = oneshot::channel();
+        self.send(EngineCommand::RecentTrades {
+            limit,
+            respond_to: tx,
+        })
+        .await
+        .expect("engine running");
+        rx.await.expect("engine response")
+    }
+
+    async fn send(&self, cmd: EngineCommand) -> Result<(), EngineError> {
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| EngineError::InvalidOrder("engine stopped".into()))
     }
 }
 
 pub fn spawn_engine_task() -> EngineHandle {
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCommand>(1024);
-    let (events, _) = broadcast::channel(4096);
-    let trades = Arc::new(Mutex::new(VecDeque::with_capacity(TRADE_HISTORY)));
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<EngineCommand>(4096);
+    let (events, _) = broadcast::channel(8192);
 
     let events_tx = events.clone();
-    let trades_store = trades.clone();
 
     tokio::spawn(async move {
         let mut engine = Engine::new();
-        let book_depth = 50;
+        let mut recent_trades: VecDeque<Trade> = VecDeque::with_capacity(TRADE_HISTORY);
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 EngineCommand::Submit { order, respond_to } => {
                     let result = engine.submit(order);
-                    if let Ok((submit, _deltas)) = &result {
+                    if let Ok((submit, deltas)) = &result {
                         for trade in &submit.trades {
-                            push_trade(&trades_store, trade.clone());
+                            record_trade(&mut recent_trades, trade.clone());
                             let _ = events_tx.send(MarketEvent::Trade(trade.clone()));
                         }
-                        publish_book(&engine, &events_tx, book_depth);
+                        for delta in deltas {
+                            let _ = events_tx.send(MarketEvent::BookDelta(delta.clone()));
+                        }
                     }
                     let _ = respond_to.send(result.map(|(s, _)| s));
                 }
-                EngineCommand::Cancel { order_id, respond_to } => {
-                    let result = engine.cancel(order_id).map(|_deltas: Vec<BookDelta>| ());
-                    if result.is_ok() {
-                        publish_book(&engine, &events_tx, book_depth);
+                EngineCommand::Cancel {
+                    order_id,
+                    respond_to,
+                } => {
+                    let result = engine.cancel(order_id);
+                    if let Ok(deltas) = &result {
+                        for delta in deltas {
+                            let _ = events_tx.send(MarketEvent::BookDelta(delta.clone()));
+                        }
                     }
-                    let _ = respond_to.send(result);
+                    let _ = respond_to.send(result.map(|_| ()));
                 }
                 EngineCommand::Snapshot { depth, respond_to } => {
                     let snap = engine.snapshot(depth);
                     let _ = respond_to.send(snap);
                 }
+                EngineCommand::GetOrder {
+                    order_id,
+                    respond_to,
+                } => {
+                    let _ = respond_to.send(engine.get_order(order_id));
+                }
+                EngineCommand::RecentTrades { limit, respond_to } => {
+                    let start = recent_trades.len().saturating_sub(limit);
+                    let slice: Vec<Trade> = recent_trades.iter().skip(start).cloned().collect();
+                    let _ = respond_to.send(slice);
+                }
             }
         }
     });
 
-    EngineHandle {
-        cmd_tx,
-        events,
-        trades,
-    }
+    EngineHandle { cmd_tx, events }
 }
 
-fn publish_book(engine: &Engine, events: &broadcast::Sender<MarketEvent>, depth: usize) {
-    let snapshot = engine.snapshot(depth);
-    let _ = events.send(MarketEvent::BookUpdate { snapshot });
+fn record_trade(recent: &mut VecDeque<Trade>, trade: Trade) {
+    if recent.len() >= TRADE_HISTORY {
+        recent.pop_front();
+    }
+    recent.push_back(trade);
 }
 
-fn push_trade(store: &Arc<Mutex<VecDeque<Trade>>>, trade: Trade) {
-    if let Ok(mut q) = store.try_lock() {
-        if q.len() >= TRADE_HISTORY {
-            q.pop_front();
-        }
-        q.push_back(trade);
-    }
+pub async fn initial_book_snapshot(handle: &EngineHandle) -> OrderBookSnapshot {
+    handle.snapshot(DEFAULT_BOOK_DEPTH).await
 }

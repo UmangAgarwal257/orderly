@@ -12,6 +12,7 @@ fn bench_match_throughput(c: &mut Criterion) {
                     order_type: OrderType::Limit { price },
                     qty: 1,
                     client_order_id: None,
+                    max_matches: None,
                 });
             }
             for i in 0..10_000u64 {
@@ -21,6 +22,7 @@ fn bench_match_throughput(c: &mut Criterion) {
                     order_type: OrderType::Limit { price },
                     qty: 1,
                     client_order_id: None,
+                    max_matches: None,
                 }));
             }
         });
