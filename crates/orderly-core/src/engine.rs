@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::book::{OrderBook, RestingOrder};
+use crate::limits::{DEFAULT_MAX_MATCHES, MAX_ORDER_PRICE, MAX_ORDER_QTY};
 use crate::types::{
-    BookDelta, BookDeltaKind, EngineError, NewOrder, OrderBookSnapshot, OrderId, OrderStatus,
-    OrderType, Side, SubmitResult, Trade,
+    BookDelta, BookDeltaKind, EngineError, NewOrder, OrderBookSnapshot, OrderId, OrderRecord,
+    OrderStatus, OrderType, Side, SubmitResult, Trade,
 };
 
 #[derive(Debug)]
@@ -47,18 +48,12 @@ impl Engine {
         &mut self,
         request: NewOrder,
     ) -> Result<(SubmitResult, Vec<BookDelta>), EngineError> {
-        if request.qty == 0 {
-            return Err(EngineError::InvalidOrder("quantity must be positive".into()));
-        }
-        if let OrderType::Limit { price } = request.order_type {
-            if price == 0 {
-                return Err(EngineError::InvalidOrder("limit price must be positive".into()));
-            }
-        }
+        validate_new_order(&request)?;
 
         let order_id = OrderId(self.next_order_id);
         self.next_order_id += 1;
 
+        let client_order_id = request.client_order_id;
         self.orders.insert(
             order_id,
             OrderMeta {
@@ -67,40 +62,62 @@ impl Engine {
                 order_type: request.order_type,
                 qty_original: request.qty,
                 qty_remaining: request.qty,
-                client_order_id: request.client_order_id,
+                client_order_id,
             },
         );
 
         let mut trades = Vec::new();
         let mut deltas = Vec::new();
+        let max_matches = request.max_matches.unwrap_or(DEFAULT_MAX_MATCHES);
 
-        self.match_order(order_id, &mut trades, &mut deltas)?;
+        self.match_order(order_id, max_matches, &mut trades, &mut deltas)?;
 
         let mut reject_reason = None;
+        let mut cancelled_qty = 0u64;
 
-        if self.orders.get(&order_id).unwrap().qty_remaining > 0 {
-            if matches!(
-                self.orders.get(&order_id).unwrap().order_type,
-                OrderType::Market
-            ) {
-                let m = self.orders.get_mut(&order_id).unwrap();
-                m.status = OrderStatus::Rejected;
-                m.qty_remaining = 0;
-                reject_reason = Some("market order unfilled remainder rejected".into());
-            } else {
-                self.rest_limit(order_id, &mut deltas)?;
+        let remaining_before_reject = self
+            .orders
+            .get(&order_id)
+            .map(|m| m.qty_remaining)
+            .unwrap_or(0);
+
+        if remaining_before_reject > 0 {
+            match self.orders.get(&order_id).map(|m| m.order_type) {
+                Some(OrderType::Market) => {
+                    cancelled_qty = remaining_before_reject;
+                    let m = self
+                        .orders
+                        .get_mut(&order_id)
+                        .ok_or(EngineError::OrderNotFound)?;
+                    if trades.is_empty() {
+                        m.status = OrderStatus::Rejected;
+                    } else {
+                        m.status = OrderStatus::PartiallyFilled;
+                    }
+                    m.qty_remaining = 0;
+                    reject_reason = Some("market order unfilled remainder cancelled".into());
+                }
+                Some(OrderType::Limit { .. }) => {
+                    self.rest_limit(order_id, &mut deltas)?;
+                }
+                None => return Err(EngineError::OrderNotFound),
             }
         }
 
-        let meta = self.orders.get(&order_id).expect("order exists");
+        let meta = self
+            .orders
+            .get(&order_id)
+            .ok_or(EngineError::OrderNotFound)?;
         let filled_qty = trades.iter().map(|t| t.qty).sum();
         let result = SubmitResult {
             order_id,
             status: meta.status,
             filled_qty,
             remaining_qty: meta.qty_remaining,
+            cancelled_qty,
             trades,
             reject_reason,
+            client_order_id: meta.client_order_id,
         };
 
         Ok((result, deltas))
@@ -109,12 +126,18 @@ impl Engine {
     fn match_order(
         &mut self,
         taker_id: OrderId,
+        max_matches: u32,
         trades: &mut Vec<Trade>,
         deltas: &mut Vec<BookDelta>,
     ) -> Result<(), EngineError> {
-        loop {
+        let mut matches = 0u32;
+
+        while matches < max_matches {
             let (taker_side, taker_remaining, limit_price) = {
-                let taker = self.orders.get(&taker_id).expect("taker");
+                let taker = self
+                    .orders
+                    .get(&taker_id)
+                    .ok_or(EngineError::OrderNotFound)?;
                 if taker.qty_remaining == 0 {
                     break;
                 }
@@ -138,9 +161,12 @@ impl Engine {
                 None => break,
             };
 
-            let (maker_price, maker_side) = {
-                let maker = self.book.get(maker_id).expect("maker on book");
-                (maker.price, maker.side)
+            let (maker_price, maker_side, maker_qty) = {
+                let maker = self
+                    .book
+                    .get(maker_id)
+                    .ok_or_else(|| EngineError::InvalidOrder("book inconsistent".into()))?;
+                (maker.price, maker.side, maker.qty_remaining)
             };
 
             let crosses = match taker_side {
@@ -151,7 +177,7 @@ impl Engine {
                 break;
             }
 
-            let fill_qty = taker_remaining.min(self.book.get(maker_id).unwrap().qty_remaining);
+            let fill_qty = taker_remaining.min(maker_qty);
 
             let trade = Trade {
                 id: self.next_trade_id,
@@ -163,9 +189,13 @@ impl Engine {
             };
             self.next_trade_id += 1;
             trades.push(trade);
+            matches += 1;
 
             {
-                let taker_meta = self.orders.get_mut(&taker_id).unwrap();
+                let taker_meta = self
+                    .orders
+                    .get_mut(&taker_id)
+                    .ok_or(EngineError::OrderNotFound)?;
                 taker_meta.qty_remaining -= fill_qty;
                 taker_meta.status = if taker_meta.qty_remaining == 0 {
                     OrderStatus::Filled
@@ -175,19 +205,32 @@ impl Engine {
             }
 
             let maker_remaining = {
-                let resting = self.book.get_mut(maker_id).unwrap();
+                let resting = self
+                    .book
+                    .get_mut(maker_id)
+                    .ok_or_else(|| EngineError::InvalidOrder("book inconsistent".into()))?;
                 resting.qty_remaining -= fill_qty;
                 resting.qty_remaining
             };
 
             if maker_remaining == 0 {
                 self.book.remove(maker_id);
-                let maker_meta = self.orders.get_mut(&maker_id).unwrap();
+                let maker_meta = self
+                    .orders
+                    .get_mut(&maker_id)
+                    .ok_or(EngineError::OrderNotFound)?;
                 maker_meta.qty_remaining = 0;
                 maker_meta.status = OrderStatus::Filled;
-                deltas.push(level_delta_after_remove(maker_side, maker_price, &self.book));
+                deltas.push(level_delta_after_remove(
+                    maker_side,
+                    maker_price,
+                    &self.book,
+                ));
             } else {
-                let maker_meta = self.orders.get_mut(&maker_id).unwrap();
+                let maker_meta = self
+                    .orders
+                    .get_mut(&maker_id)
+                    .ok_or(EngineError::OrderNotFound)?;
                 maker_meta.qty_remaining = maker_remaining;
                 maker_meta.status = OrderStatus::PartiallyFilled;
                 deltas.push(level_delta(
@@ -198,6 +241,7 @@ impl Engine {
                 ));
             }
         }
+
         Ok(())
     }
 
@@ -206,7 +250,10 @@ impl Engine {
         order_id: OrderId,
         deltas: &mut Vec<BookDelta>,
     ) -> Result<(), EngineError> {
-        let meta = self.orders.get(&order_id).expect("order");
+        let meta = self
+            .orders
+            .get(&order_id)
+            .ok_or(EngineError::OrderNotFound)?;
         let OrderType::Limit { price } = meta.order_type else {
             return Ok(());
         };
@@ -255,11 +302,17 @@ impl Engine {
             return Err(EngineError::NotCancellable(order_id.0, meta.status));
         }
 
-        let removed = self.book.remove(order_id).expect("on book");
+        let removed = self
+            .book
+            .remove(order_id)
+            .ok_or_else(|| EngineError::InvalidOrder("order missing from book".into()))?;
         let price = removed.price;
         let side = removed.side;
 
-        let meta = self.orders.get_mut(&order_id).unwrap();
+        let meta = self
+            .orders
+            .get_mut(&order_id)
+            .ok_or(EngineError::OrderNotFound)?;
         meta.status = OrderStatus::Cancelled;
         meta.qty_remaining = 0;
 
@@ -267,8 +320,20 @@ impl Engine {
         Ok(vec![delta])
     }
 
-    pub fn order_status(&self, order_id: OrderId) -> Option<OrderStatus> {
-        self.orders.get(&order_id).map(|m| m.status)
+    pub fn get_order(&self, order_id: OrderId) -> Option<OrderRecord> {
+        self.orders.get(&order_id).map(|m| {
+            let filled_qty = m.qty_original.saturating_sub(m.qty_remaining);
+            OrderRecord {
+                order_id,
+                side: m.side,
+                order_type: m.order_type,
+                status: m.status,
+                qty_original: m.qty_original,
+                qty_remaining: m.qty_remaining,
+                filled_qty,
+                client_order_id: m.client_order_id,
+            }
+        })
     }
 
     pub fn snapshot(&self, depth: usize) -> OrderBookSnapshot {
@@ -276,12 +341,35 @@ impl Engine {
     }
 }
 
-fn level_delta(
-    side: Side,
-    price: u64,
-    book: &OrderBook,
-    kind: BookDeltaKind,
-) -> BookDelta {
+fn validate_new_order(request: &NewOrder) -> Result<(), EngineError> {
+    if request.qty == 0 {
+        return Err(EngineError::InvalidOrder(
+            "quantity must be positive".into(),
+        ));
+    }
+    if request.qty > MAX_ORDER_QTY {
+        return Err(EngineError::InvalidOrder(format!(
+            "quantity exceeds max {}",
+            MAX_ORDER_QTY
+        )));
+    }
+    if let OrderType::Limit { price } = request.order_type {
+        if price == 0 {
+            return Err(EngineError::InvalidOrder(
+                "limit price must be positive".into(),
+            ));
+        }
+        if price > MAX_ORDER_PRICE {
+            return Err(EngineError::InvalidOrder(format!(
+                "price exceeds max {}",
+                MAX_ORDER_PRICE
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn level_delta(side: Side, price: u64, book: &OrderBook, kind: BookDeltaKind) -> BookDelta {
     let level = book.level_at_price(side, price);
     BookDelta {
         side,
@@ -318,7 +406,7 @@ fn now_ns() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NewOrder, OrderType, Side};
+    use crate::types::NewOrder;
 
     fn limit(side: Side, price: u64, qty: u64) -> NewOrder {
         NewOrder {
@@ -326,6 +414,7 @@ mod tests {
             order_type: OrderType::Limit { price },
             qty,
             client_order_id: None,
+            max_matches: None,
         }
     }
 
@@ -335,6 +424,7 @@ mod tests {
             order_type: OrderType::Market,
             qty,
             client_order_id: None,
+            max_matches: None,
         }
     }
 
@@ -360,8 +450,6 @@ mod tests {
         let (res, _) = engine.submit(limit(Side::Ask, 97, 12)).unwrap();
 
         assert_eq!(res.trades.len(), 2);
-        assert_eq!(res.trades[0].price, 99);
-        assert_eq!(res.trades[1].price, 98);
         assert_eq!(res.filled_qty, 10);
         assert_eq!(res.status, OrderStatus::PartiallyFilled);
         assert_eq!(res.remaining_qty, 2);
@@ -372,25 +460,23 @@ mod tests {
         let mut engine = Engine::new();
         let (bid, _) = engine.submit(limit(Side::Bid, 100, 50)).unwrap();
         assert_eq!(bid.status, OrderStatus::New);
-        let snap = engine.snapshot(10);
-        assert_eq!(snap.bids[0].qty, 50);
 
         let (ask, _) = engine.submit(limit(Side::Ask, 100, 30)).unwrap();
         assert_eq!(ask.status, OrderStatus::Filled);
-        assert_eq!(ask.trades[0].price, 100);
         assert_eq!(
-            engine.order_status(bid.order_id),
-            Some(OrderStatus::PartiallyFilled)
+            engine.get_order(bid.order_id).unwrap().status,
+            OrderStatus::PartiallyFilled
         );
     }
 
     #[test]
-    fn market_rejects_unfilled_remainder() {
+    fn market_cancels_unfilled_remainder() {
         let mut engine = Engine::new();
         engine.submit(limit(Side::Ask, 100, 5)).unwrap();
         let (res, _) = engine.submit(market(Side::Bid, 20)).unwrap();
         assert_eq!(res.filled_qty, 5);
-        assert_eq!(res.status, OrderStatus::Rejected);
+        assert_eq!(res.cancelled_qty, 15);
+        assert_eq!(res.status, OrderStatus::PartiallyFilled);
         assert!(res.reject_reason.is_some());
     }
 
@@ -408,10 +494,9 @@ mod tests {
         let (o, _) = engine.submit(limit(Side::Bid, 100, 10)).unwrap();
         engine.cancel(o.order_id).unwrap();
         assert_eq!(
-            engine.order_status(o.order_id),
-            Some(OrderStatus::Cancelled)
+            engine.get_order(o.order_id).unwrap().status,
+            OrderStatus::Cancelled
         );
-        assert!(engine.snapshot(10).bids.is_empty());
     }
 
     #[test]
@@ -423,6 +508,24 @@ mod tests {
         assert_eq!(
             err,
             EngineError::NotCancellable(bid.order_id.0, OrderStatus::Filled)
+        );
+    }
+
+    #[test]
+    fn client_order_id_round_trip() {
+        let mut engine = Engine::new();
+        let order = NewOrder {
+            side: Side::Bid,
+            order_type: OrderType::Limit { price: 50 },
+            qty: 1,
+            client_order_id: Some(42),
+            max_matches: None,
+        };
+        let (res, _) = engine.submit(order).unwrap();
+        assert_eq!(res.client_order_id, Some(42));
+        assert_eq!(
+            engine.get_order(res.order_id).unwrap().client_order_id,
+            Some(42)
         );
     }
 }

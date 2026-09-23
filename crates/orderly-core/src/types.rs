@@ -50,12 +50,26 @@ pub struct OrderBookSnapshot {
     pub asks: Vec<BookLevel>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderRecord {
+    pub order_id: OrderId,
+    pub side: Side,
+    pub order_type: OrderType,
+    pub status: OrderStatus,
+    pub qty_original: u64,
+    pub qty_remaining: u64,
+    pub filled_qty: u64,
+    pub client_order_id: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewOrder {
     pub side: Side,
     pub order_type: OrderType,
     pub qty: u64,
     pub client_order_id: Option<u64>,
+    /// Max maker touches per submit; defaults to `limits::DEFAULT_MAX_MATCHES`.
+    pub max_matches: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,18 +78,21 @@ pub struct SubmitResult {
     pub status: OrderStatus,
     pub filled_qty: u64,
     pub remaining_qty: u64,
+    pub cancelled_qty: u64,
     pub trades: Vec<Trade>,
     pub reject_reason: Option<String>,
+    pub client_order_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BookDeltaKind {
     Add,
     Update,
     Remove,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookDelta {
     pub side: Side,
     pub price: u64,

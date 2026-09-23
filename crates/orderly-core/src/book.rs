@@ -61,7 +61,7 @@ pub(crate) struct OrderBook {
 }
 
 impl OrderBook {
-    pub fn insert(&mut self, order: RestingOrder) {
+    pub(crate) fn insert(&mut self, order: RestingOrder) {
         let id = order.id;
         let side = order.side;
         let price = order.price;
@@ -77,15 +77,15 @@ impl OrderBook {
         }
     }
 
-    pub fn get(&self, id: OrderId) -> Option<&RestingOrder> {
+    pub(crate) fn get(&self, id: OrderId) -> Option<&RestingOrder> {
         self.orders.get(&id)
     }
 
-    pub fn get_mut(&mut self, id: OrderId) -> Option<&mut RestingOrder> {
+    pub(crate) fn get_mut(&mut self, id: OrderId) -> Option<&mut RestingOrder> {
         self.orders.get_mut(&id)
     }
 
-    pub fn remove(&mut self, id: OrderId) -> Option<RestingOrder> {
+    pub(crate) fn remove(&mut self, id: OrderId) -> Option<RestingOrder> {
         let order = self.orders.remove(&id)?;
         match order.side {
             Side::Ask => {
@@ -104,23 +104,15 @@ impl OrderBook {
         Some(order)
     }
 
-    pub fn best_ask_key(&self) -> Option<AskKey> {
-        self.asks.keys().next().copied()
-    }
-
-    pub fn best_bid_key(&self) -> Option<BidKey> {
-        self.bids.keys().next().copied()
-    }
-
-    pub fn best_ask_id(&self) -> Option<OrderId> {
+    pub(crate) fn best_ask_id(&self) -> Option<OrderId> {
         self.asks.values().next().copied()
     }
 
-    pub fn best_bid_id(&self) -> Option<OrderId> {
+    pub(crate) fn best_bid_id(&self) -> Option<OrderId> {
         self.bids.values().next().copied()
     }
 
-    pub fn level_at_price(&self, side: Side, price: u64) -> BookLevel {
+    pub(crate) fn level_at_price(&self, side: Side, price: u64) -> BookLevel {
         let (qty, count) = self
             .orders
             .values()
@@ -133,7 +125,7 @@ impl OrderBook {
         }
     }
 
-    pub fn snapshot(&self, depth: usize) -> OrderBookSnapshot {
+    pub(crate) fn snapshot(&self, depth: usize) -> OrderBookSnapshot {
         OrderBookSnapshot {
             bids: aggregate_bids(&self.orders, depth),
             asks: aggregate_asks(&self.orders, depth),
@@ -141,7 +133,7 @@ impl OrderBook {
     }
 }
 
-pub(crate) fn aggregate_bids(orders: &HashMap<OrderId, RestingOrder>, depth: usize) -> Vec<BookLevel> {
+fn aggregate_bids(orders: &HashMap<OrderId, RestingOrder>, depth: usize) -> Vec<BookLevel> {
     let mut levels: BTreeMap<u64, (u64, u32)> = BTreeMap::new();
     for o in orders.values().filter(|o| o.side == Side::Bid) {
         let e = levels.entry(o.price).or_insert((0, 0));
@@ -156,12 +148,12 @@ pub(crate) fn aggregate_bids(orders: &HashMap<OrderId, RestingOrder>, depth: usi
             order_count,
         })
         .collect();
-    out.sort_by(|a, b| b.price.cmp(&a.price));
+    out.sort_by_key(|level| std::cmp::Reverse(level.price));
     out.truncate(depth);
     out
 }
 
-pub(crate) fn aggregate_asks(orders: &HashMap<OrderId, RestingOrder>, depth: usize) -> Vec<BookLevel> {
+fn aggregate_asks(orders: &HashMap<OrderId, RestingOrder>, depth: usize) -> Vec<BookLevel> {
     let mut levels: BTreeMap<u64, (u64, u32)> = BTreeMap::new();
     for o in orders.values().filter(|o| o.side == Side::Ask) {
         let e = levels.entry(o.price).or_insert((0, 0));
@@ -176,7 +168,7 @@ pub(crate) fn aggregate_asks(orders: &HashMap<OrderId, RestingOrder>, depth: usi
             order_count,
         })
         .collect();
-    out.sort_by(|a, b| a.price.cmp(&b.price));
+    out.sort_by_key(|level| level.price);
     out.truncate(depth);
     out
 }
